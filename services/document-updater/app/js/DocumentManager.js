@@ -457,6 +457,50 @@ const DocumentManager = {
     }
   },
 
+  async addComment(projectId, docId, threadId, userId, text, offset) {
+    // Circular dependencies. Import at runtime.
+    const UpdateManager = require('./UpdateManager')
+
+    const { lines, version, alreadyLoaded, type } =
+      await DocumentManager.getDoc(projectId, docId)
+    if (lines == null || version == null) {
+      throw new Errors.NotFoundError(`document not found: ${docId}`)
+    }
+    if (type !== 'sharejs-text-ot') {
+      throw new Errors.OTTypeMismatchError(type, 'sharejs-text-ot')
+    }
+
+    // Check under the lock: ShareJS would reject a mismatching op too, but
+    // that disconnects every editor on the doc.
+    const docText = lines.join('\n')
+    if (docText.slice(offset, offset + text.length) !== text) {
+      throw new Errors.DocumentValidationError(
+        'comment text does not match document at offset',
+        { docId, offset }
+      )
+    }
+
+    const update = {
+      doc: docId,
+      op: [{ c: text, p: offset, t: threadId }],
+      v: version,
+      meta: { user_id: userId, type: 'external', source: 'add-comment' },
+    }
+    await UpdateManager.promises.applyUpdate(projectId, docId, update)
+
+    // Same flush as setDoc: leave a loaded doc to the usual flushing,
+    // evict a doc that was loaded only for this update.
+    if (alreadyLoaded) {
+      await DocumentManager.flushDocIfLoaded(projectId, docId)
+    } else {
+      try {
+        await DocumentManager.flushAndDeleteDoc(projectId, docId, {})
+      } finally {
+        HistoryManager.flushProjectChangesAsync(projectId)
+      }
+    }
+  },
+
   async getComment(projectId, docId, commentId) {
     let { lines, ranges, type } = await DocumentManager.getDoc(projectId, docId)
 
@@ -746,6 +790,19 @@ const DocumentManager = {
       threadId,
       userId,
       resolved
+    )
+  },
+
+  async addCommentWithLock(projectId, docId, threadId, userId, text, offset) {
+    const UpdateManager = require('./UpdateManager')
+    await UpdateManager.promises.lockUpdatesAndDo(
+      DocumentManager.addComment,
+      projectId,
+      docId,
+      threadId,
+      userId,
+      text,
+      offset
     )
   },
 
