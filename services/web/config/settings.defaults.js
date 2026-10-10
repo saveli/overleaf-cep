@@ -1203,6 +1203,7 @@ module.exports = {
     'registration-page', // import after authentication
     'template-gallery',
     'git-bridge',
+    'token-api',
     'github-sync',
     'zotero',
   ],
