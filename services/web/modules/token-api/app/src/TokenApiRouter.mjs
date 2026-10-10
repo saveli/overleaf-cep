@@ -20,5 +20,10 @@ export default {
       ...guard,
       TokenApiController.getRanges
     )
+    publicApiRouter.get(
+      '/api/v1/project/:project_id/threads',
+      ...guard,
+      TokenApiController.getThreads
+    )
   },
 }
