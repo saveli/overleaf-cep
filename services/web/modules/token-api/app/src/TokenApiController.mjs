@@ -8,29 +8,26 @@ import ProjectGetter from '../../../../app/src/Features/Project/ProjectGetter.mj
 import UserGetter from '../../../../app/src/Features/User/UserGetter.mjs'
 import UserInfoController from '../../../../app/src/Features/User/UserInfoController.mjs'
 import UserInfoManager from '../../../../app/src/Features/User/UserInfoManager.mjs'
-import { notFound } from './TokenApiAuthMiddleware.mjs'
+import { ID_REGEX, notFound } from './TokenApiAuthMiddleware.mjs'
 
-const ID_REGEX = /^[0-9a-f]{24}$/
-// Same limit as the chat service (MessageHttpSchemas MAX_MESSAGE_LENGTH).
-const MAX_MESSAGE_LENGTH = 10 * 1024
+const MAX_MESSAGE_LENGTH = 10 * 1024 // chat's limit
 
-// Chat or document-updater answered 404 (unknown thread/doc) -> our 404 body.
-// Chat upserts threads on every lookup, so a mistyped thread ID would create an
-// orphan thread with no anchor. Only accept IDs chat already knows.
-async function threadExists(projectId, threadId) {
-  const threads = await ChatApiHandler.promises.getThreads(projectId)
-  return Object.hasOwn(threads, threadId)
-}
-
+// A 404 (unknown thread, comment not in that doc) or 400 from chat or
+// document-updater becomes the API's fixed body; anything else is a 500.
 function handleWriteError(err, res, next) {
-  if (err instanceof RequestFailedError && err.response?.status === 404) {
-    return notFound(res)
+  if (err instanceof RequestFailedError) {
+    if (err.response.status === 404) return notFound(res)
+    if (err.response.status === 400) {
+      return res.status(400).json({ error: 'bad request' })
+    }
   }
   next(err)
 }
 
 function iso(value) {
-  return value == null ? null : new Date(value).toISOString()
+  if (value == null) return null
+  const date = new Date(value)
+  return isNaN(date) ? null : date.toISOString()
 }
 
 // '2026-10-10T12:34:56.789Z' -> '2026-10-10 12:34'
@@ -38,6 +35,7 @@ function shortTime(isoString) {
   return isoString ? isoString.slice(0, 16).replace('T', ' ') : '?'
 }
 
+// op.p counts UTF-16 code units of lines.join('\n'), as does String.slice.
 function lineAt(text, offset) {
   return text.slice(0, offset).split('\n').length
 }
@@ -82,7 +80,7 @@ function toMarkdown(view) {
     }
     const state = thread.resolved ? 'resolved' : 'open'
     const where = thread.line != null ? `Line ${thread.line}` : 'Thread'
-    out.push('', `### ${where} (${state})`)
+    out.push('', `### ${where} (${state}) [thread ${thread.id}]`)
     if (thread.quote != null) {
       out.push(...thread.quote.split('\n').map(line => `> ${line}`))
     }
@@ -99,8 +97,9 @@ function toMarkdown(view) {
     for (const change of view.changes) {
       const name = change.author?.name ?? change.author?.id ?? 'unknown'
       const where = `${change.file ?? '(no file)'}:${change.line ?? '?'}`
+      // JSON string literal: newlines and backticks cannot break the list item
       out.push(
-        `- ${where} ${change.type} by ${name}, ${shortTime(change.time)}: \`${change.text}\``
+        `- ${where} ${change.type} by ${name}, ${shortTime(change.time)}: ${JSON.stringify(change.text)}`
       )
     }
   }
@@ -124,36 +123,32 @@ const TokenApiController = {
     try {
       const { project_id } = req.params
       await DocumentUpdaterHandler.promises.flushProjectToMongo(project_id)
-      const [project, allDocs, rangeDocs, chatThreads] = await Promise.all([
+      // lines and ranges from one docstore read, so offsets match the text
+      const [project, paths, docs, chatThreads] = await Promise.all([
         ProjectGetter.promises.getProject(project_id, { name: 1 }),
-        ProjectEntityHandler.promises.getAllDocs(project_id),
-        DocstoreManager.promises.getAllRanges(project_id),
+        ProjectEntityHandler.promises.getAllDocPathsFromProjectById(project_id),
+        DocstoreManager.promises.getAllDocsWithRanges(project_id),
         ChatApiHandler.promises.getThreads(project_id),
       ])
 
-      const docsById = new Map()
-      for (const [path, doc] of Object.entries(allDocs)) {
-        docsById.set(doc._id.toString(), {
-          path: path.replace(/^\//, ''),
-          text: doc.lines.join('\n'),
-        })
-      }
-
       const anchors = new Map()
       const rawChanges = []
-      for (const rangeDoc of rangeDocs) {
-        const doc = docsById.get(rangeDoc._id.toString())
-        const locate = p =>
-          doc
-            ? { file: doc.path, line: lineAt(doc.text, p) }
-            : { file: null, line: null }
-        for (const comment of rangeDoc.ranges?.comments ?? []) {
+      for (const doc of docs) {
+        const docId = doc._id.toString()
+        const file = paths[docId]?.replace(/^\//, '') ?? null
+        const text = (doc.lines ?? []).join('\n')
+        const locate = p => ({
+          file,
+          line: file != null ? lineAt(text, p) : null,
+        })
+        for (const comment of doc.ranges?.comments ?? []) {
           anchors.set(String(comment.op.t), {
+            doc_id: docId,
             ...locate(comment.op.p),
             quote: comment.op.c,
           })
         }
-        for (const change of rangeDoc.ranges?.changes ?? []) {
+        for (const change of doc.ranges?.changes ?? []) {
           rawChanges.push({ change, ...locate(change.op.p) })
         }
       }
@@ -169,9 +164,15 @@ const TokenApiController = {
       const threadIds = new Set([...Object.keys(chatThreads), ...anchors.keys()])
       const threads = [...threadIds].map(id => {
         const chat = chatThreads[id] ?? {}
-        const anchor = anchors.get(id) ?? { file: null, line: null, quote: null }
+        const anchor = anchors.get(id) ?? {
+          doc_id: null,
+          file: null,
+          line: null,
+          quote: null,
+        }
         return {
           id,
+          doc_id: anchor.doc_id,
           file: anchor.file,
           line: anchor.line,
           quote: anchor.quote,
@@ -224,25 +225,27 @@ const TokenApiController = {
   },
 
   async sendMessage(req, res, next) {
-    const content = req.body?.content
-    if (
-      typeof content !== 'string' ||
-      content.trim() === '' ||
-      content.length > MAX_MESSAGE_LENGTH
-    ) {
-      return res.status(400).json({ error: 'bad request' })
-    }
     try {
       const { project_id, thread_id } = req.params
-      if (!(await threadExists(project_id, thread_id))) return notFound(res)
+      const content = req.body?.content
+      if (
+        typeof content !== 'string' ||
+        content.trim() === '' ||
+        content.length > MAX_MESSAGE_LENGTH
+      ) {
+        return res.status(400).json({ error: 'bad request' })
+      }
+      // Reading a thread does not create it; sending to one does. Reject
+      // unknown IDs instead of creating an orphan thread without an anchor.
+      await ChatApiHandler.promises.getThread(project_id, thread_id)
       const userId = req.tokenUserId
+      const user = await UserInfoManager.promises.getPersonalInfo(userId)
       const message = await ChatApiHandler.promises.sendComment(
         project_id,
         thread_id,
         userId,
         content
       )
-      const user = await UserInfoManager.promises.getPersonalInfo(userId)
       message.user = UserInfoController.formatPersonalInfo(user)
       EditorRealTimeController.emitToRoom(
         project_id,
@@ -263,7 +266,9 @@ const TokenApiController = {
   async resolveThread(req, res, next) {
     try {
       const { project_id, doc_id, thread_id } = req.params
-      if (!(await threadExists(project_id, thread_id))) return notFound(res)
+      // 404 unless the comment is anchored in this doc of this project; the
+      // chat write below must not happen for a wrong doc_id.
+      await DocumentUpdaterHandler.promises.getComment(project_id, doc_id, thread_id)
       const userId = req.tokenUserId
       const user = await UserInfoManager.promises.getPersonalInfo(userId)
       await ChatApiHandler.promises.resolveThread(project_id, thread_id, userId)
@@ -288,7 +293,7 @@ const TokenApiController = {
   async reopenThread(req, res, next) {
     try {
       const { project_id, doc_id, thread_id } = req.params
-      if (!(await threadExists(project_id, thread_id))) return notFound(res)
+      await DocumentUpdaterHandler.promises.getComment(project_id, doc_id, thread_id)
       await ChatApiHandler.promises.reopenThread(project_id, thread_id)
       EditorRealTimeController.emitToRoom(project_id, 'reopen-thread', thread_id)
       await DocumentUpdaterHandler.promises.reopenThread(
