@@ -11,7 +11,7 @@ function unauthorized(req, res, reason) {
   res.status(401).json({ error: 'unauthorized' })
 }
 
-function notFound(res) {
+export function notFound(res) {
   res.status(404).json({ error: 'not found' })
 }
 

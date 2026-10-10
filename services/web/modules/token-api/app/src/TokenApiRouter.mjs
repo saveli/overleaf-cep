@@ -25,5 +25,20 @@ export default {
       ...guard,
       TokenApiController.getThreads
     )
+    publicApiRouter.post(
+      '/api/v1/project/:project_id/thread/:thread_id/messages',
+      ...guard,
+      TokenApiController.sendMessage
+    )
+    publicApiRouter.post(
+      '/api/v1/project/:project_id/doc/:doc_id/thread/:thread_id/resolve',
+      ...guard,
+      TokenApiController.resolveThread
+    )
+    publicApiRouter.post(
+      '/api/v1/project/:project_id/doc/:doc_id/thread/:thread_id/reopen',
+      ...guard,
+      TokenApiController.reopenThread
+    )
   },
 }

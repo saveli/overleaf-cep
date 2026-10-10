@@ -1,11 +1,26 @@
+import { RequestFailedError } from '@overleaf/fetch-utils'
 import ChatApiHandler from '../../../../app/src/Features/Chat/ChatApiHandler.mjs'
 import DocstoreManager from '../../../../app/src/Features/Docstore/DocstoreManager.mjs'
 import DocumentUpdaterHandler from '../../../../app/src/Features/DocumentUpdater/DocumentUpdaterHandler.mjs'
+import EditorRealTimeController from '../../../../app/src/Features/Editor/EditorRealTimeController.mjs'
 import ProjectEntityHandler from '../../../../app/src/Features/Project/ProjectEntityHandler.mjs'
 import ProjectGetter from '../../../../app/src/Features/Project/ProjectGetter.mjs'
 import UserGetter from '../../../../app/src/Features/User/UserGetter.mjs'
+import UserInfoController from '../../../../app/src/Features/User/UserInfoController.mjs'
+import UserInfoManager from '../../../../app/src/Features/User/UserInfoManager.mjs'
+import { notFound } from './TokenApiAuthMiddleware.mjs'
 
 const ID_REGEX = /^[0-9a-f]{24}$/
+// Same limit as the chat service (MessageHttpSchemas MAX_MESSAGE_LENGTH).
+const MAX_MESSAGE_LENGTH = 10 * 1024
+
+// Chat or document-updater answered 404 (unknown thread/doc) -> our 404 body.
+function handleWriteError(err, res, next) {
+  if (err instanceof RequestFailedError && err.response?.status === 404) {
+    return notFound(res)
+  }
+  next(err)
+}
 
 function iso(value) {
   return value == null ? null : new Date(value).toISOString()
@@ -196,6 +211,83 @@ const TokenApiController = {
       }
     } catch (err) {
       next(err)
+    }
+  },
+
+  async sendMessage(req, res, next) {
+    const content = req.body?.content
+    if (
+      typeof content !== 'string' ||
+      content.trim() === '' ||
+      content.length > MAX_MESSAGE_LENGTH
+    ) {
+      return res.status(400).json({ error: 'bad request' })
+    }
+    try {
+      const { project_id, thread_id } = req.params
+      const userId = req.tokenUserId
+      const message = await ChatApiHandler.promises.sendComment(
+        project_id,
+        thread_id,
+        userId,
+        content
+      )
+      const user = await UserInfoManager.promises.getPersonalInfo(userId)
+      message.user = UserInfoController.formatPersonalInfo(user)
+      EditorRealTimeController.emitToRoom(
+        project_id,
+        'new-comment',
+        thread_id,
+        message
+      )
+      res.status(201).json({
+        id: message.id,
+        time: iso(message.timestamp),
+        content: message.content,
+      })
+    } catch (err) {
+      handleWriteError(err, res, next)
+    }
+  },
+
+  async resolveThread(req, res, next) {
+    try {
+      const { project_id, doc_id, thread_id } = req.params
+      const userId = req.tokenUserId
+      const user = await UserInfoManager.promises.getPersonalInfo(userId)
+      await ChatApiHandler.promises.resolveThread(project_id, thread_id, userId)
+      EditorRealTimeController.emitToRoom(
+        project_id,
+        'resolve-thread',
+        thread_id,
+        UserInfoController.formatPersonalInfo(user)
+      )
+      await DocumentUpdaterHandler.promises.resolveThread(
+        project_id,
+        doc_id,
+        thread_id,
+        userId
+      )
+      res.sendStatus(204)
+    } catch (err) {
+      handleWriteError(err, res, next)
+    }
+  },
+
+  async reopenThread(req, res, next) {
+    try {
+      const { project_id, doc_id, thread_id } = req.params
+      await ChatApiHandler.promises.reopenThread(project_id, thread_id)
+      EditorRealTimeController.emitToRoom(project_id, 'reopen-thread', thread_id)
+      await DocumentUpdaterHandler.promises.reopenThread(
+        project_id,
+        doc_id,
+        thread_id,
+        req.tokenUserId
+      )
+      res.sendStatus(204)
+    } catch (err) {
+      handleWriteError(err, res, next)
     }
   },
 }
