@@ -82,7 +82,9 @@ function toMarkdown(view) {
     if (thread.messages.length > 0) out.push('')
     for (const message of thread.messages) {
       const name = message.author?.name ?? message.author?.id ?? 'unknown'
-      out.push(`- **${name}**, ${shortTime(message.time)}: ${message.content}`)
+      out.push(
+        `- **${name}**, ${shortTime(message.time)}: ${message.content.replaceAll('\n', '\n  ')}`
+      )
     }
   }
   if (view.changes.length > 0) {
