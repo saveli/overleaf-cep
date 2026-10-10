@@ -457,21 +457,42 @@ const DocumentManager = {
     }
   },
 
-  async addComment(projectId, docId, threadId, userId, text, offset) {
+  async addComment(
+    projectId,
+    docId,
+    threadId,
+    userId,
+    text,
+    offset,
+    expectedVersion
+  ) {
     // Circular dependencies. Import at runtime.
     const UpdateManager = require('./UpdateManager')
 
-    const { lines, version, alreadyLoaded, type } =
-      await DocumentManager.getDoc(projectId, docId)
+    const { lines, version, ranges, type } = await DocumentManager.getDoc(
+      projectId,
+      docId
+    )
     if (lines == null || version == null) {
       throw new Errors.NotFoundError(`document not found: ${docId}`)
     }
     if (type !== 'sharejs-text-ot') {
       throw new Errors.OTTypeMismatchError(type, 'sharejs-text-ot')
     }
+    // Everything below is checked here, under the lock, because a rejection
+    // inside applyUpdate happens after ShareJS has broadcast the op and
+    // disconnects every editor on the doc.
+    if (expectedVersion != null && expectedVersion !== version) {
+      throw new Errors.DocumentValidationError('document changed', {
+        docId,
+        expectedVersion,
+        version,
+      })
+    }
+    if ((ranges?.comments?.length ?? 0) >= RangesManager.MAX_COMMENTS) {
+      throw new Errors.DocumentValidationError('too many comments', { docId })
+    }
 
-    // Check under the lock: ShareJS would reject a mismatching op too, but
-    // that disconnects every editor on the doc.
     const docText = lines.join('\n')
     if (docText.slice(offset, offset + text.length) !== text) {
       throw new Errors.DocumentValidationError(
@@ -480,25 +501,16 @@ const DocumentManager = {
       )
     }
 
+    // No meta.type 'external': that would show every editor the "document
+    // updated externally" modal. The op is broadcast to all clients anyway.
     const update = {
       doc: docId,
       op: [{ c: text, p: offset, t: threadId }],
       v: version,
-      meta: { user_id: userId, type: 'external', source: 'add-comment' },
+      meta: { user_id: userId, source: 'add-comment' },
     }
     await UpdateManager.promises.applyUpdate(projectId, docId, update)
-
-    // Same flush as setDoc: leave a loaded doc to the usual flushing,
-    // evict a doc that was loaded only for this update.
-    if (alreadyLoaded) {
-      await DocumentManager.flushDocIfLoaded(projectId, docId)
-    } else {
-      try {
-        await DocumentManager.flushAndDeleteDoc(projectId, docId, {})
-      } finally {
-        HistoryManager.flushProjectChangesAsync(projectId)
-      }
-    }
+    // Only ranges changed; the usual flushing persists them.
   },
 
   async getComment(projectId, docId, commentId) {
@@ -793,7 +805,15 @@ const DocumentManager = {
     )
   },
 
-  async addCommentWithLock(projectId, docId, threadId, userId, text, offset) {
+  async addCommentWithLock(
+    projectId,
+    docId,
+    threadId,
+    userId,
+    text,
+    offset,
+    expectedVersion
+  ) {
     const UpdateManager = require('./UpdateManager')
     await UpdateManager.promises.lockUpdatesAndDo(
       DocumentManager.addComment,
@@ -802,7 +822,8 @@ const DocumentManager = {
       threadId,
       userId,
       text,
-      offset
+      offset,
+      expectedVersion
     )
   },
 

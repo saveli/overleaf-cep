@@ -44,15 +44,20 @@ function lineAt(text, offset) {
   return text.slice(0, offset).split('\n').length
 }
 
-// Offsets of all occurrences of quote in text (overlapping ones included).
+// First two occurrences of quote in text: enough to tell unique from ambiguous.
 function findOffsets(text, quote) {
-  const offsets = []
-  let i = text.indexOf(quote)
-  while (i !== -1) {
-    offsets.push(i)
-    i = text.indexOf(quote, i + 1)
-  }
-  return offsets
+  const first = text.indexOf(quote)
+  if (first === -1) return []
+  const second = text.indexOf(quote, first + 1)
+  return second === -1 ? [first] : [first, second]
+}
+
+// UTF-16 offsets (what ShareJS counts): true if i falls between the halves of a surrogate pair.
+function splitsSurrogatePair(text, i) {
+  return (
+    /[\uD800-\uDBFF]/.test(text[i - 1] ?? '') &&
+    /[\uDC00-\uDFFF]/.test(text[i] ?? '')
+  )
 }
 
 function byFileLine(a, b) {
@@ -305,7 +310,7 @@ const TokenApiController = {
       )
       if (!docId) return notFound(res)
 
-      const { lines } = await DocumentUpdaterHandler.promises.getDocument(
+      const { lines, version } = await DocumentUpdaterHandler.promises.getDocument(
         project_id,
         docId,
         -1
@@ -326,13 +331,14 @@ const TokenApiController = {
             .json({ error: 'conflict', reason: 'quote not found' })
         }
         if (offsets.length > 1) {
-          return res.status(409).json({
-            error: 'conflict',
-            reason: 'quote ambiguous',
-            occurrences: offsets.length,
-          })
+          return res
+            .status(409)
+            .json({ error: 'conflict', reason: 'quote ambiguous' })
         }
         at = offsets[0]
+      }
+      if (splitsSurrogatePair(text, at) || splitsSurrogatePair(text, at + quote.length)) {
+        return res.status(400).json({ error: 'bad request' })
       }
       const line = lineAt(text, at)
 
@@ -346,6 +352,14 @@ const TokenApiController = {
         userId,
         content
       )
+      // Editors learn the thread before the op arrives, as with the editor's own flow.
+      message.user = UserInfoController.formatPersonalInfo(user)
+      EditorRealTimeController.emitToRoom(
+        project_id,
+        'new-comment',
+        threadId,
+        message
+      )
       try {
         // All three IDs are 24-hex: project_id checked by the middleware,
         // docId from the project, threadId generated above.
@@ -358,38 +372,38 @@ const TokenApiController = {
               user_id: userId,
               text: quote,
               offset: at,
+              version,
             },
             signal: AbortSignal.timeout(30 * 1000),
           }
         )
       } catch (err) {
-        // No orphan thread without an anchor.
-        try {
-          await ChatApiHandler.promises.deleteThread(project_id, threadId)
-        } catch (deleteErr) {
+        // Roll back both sides. After a timeout the outcome is unknown, so the
+        // range is removed too (a no-op if it was never applied).
+        const warn = (e, what) =>
           logger.warn(
-            { err: deleteErr, projectId: project_id, threadId },
-            'token-api: could not delete thread after failed anchor'
+            { err: e, projectId: project_id, docId, threadId },
+            `token-api: ${what} after failed anchor`
           )
-        }
+        await DocumentUpdaterHandler.promises
+          .deleteThread(project_id, docId, threadId, userId)
+          .catch(e => warn(e, 'could not remove range'))
+        await ChatApiHandler.promises
+          .deleteThread(project_id, threadId)
+          .catch(e => warn(e, 'could not delete thread'))
+        EditorRealTimeController.emitToRoom(project_id, 'delete-thread', threadId)
         if (err instanceof RequestFailedError) {
+          // 422: text or version changed, too many comments, or not a ShareJS doc
           if (err.response.status === 422) {
             return res
               .status(409)
-              .json({ error: 'conflict', reason: 'text changed' })
+              .json({ error: 'conflict', reason: 'anchor rejected' })
           }
           if (err.response.status === 404) return notFound(res)
         }
         return next(err)
       }
 
-      message.user = UserInfoController.formatPersonalInfo(user)
-      EditorRealTimeController.emitToRoom(
-        project_id,
-        'new-comment',
-        threadId,
-        message
-      )
       res.status(201).json({
         thread_id: threadId,
         doc_id: docId,
