@@ -26,6 +26,11 @@ export default {
       TokenApiController.getThreads
     )
     publicApiRouter.post(
+      '/api/v1/project/:project_id/comments',
+      ...guard,
+      TokenApiController.createComment
+    )
+    publicApiRouter.post(
       '/api/v1/project/:project_id/thread/:thread_id/messages',
       ...guard,
       TokenApiController.sendMessage

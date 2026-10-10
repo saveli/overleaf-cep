@@ -1,4 +1,7 @@
-import { RequestFailedError } from '@overleaf/fetch-utils'
+import { fetchNothing, RequestFailedError } from '@overleaf/fetch-utils'
+import logger from '@overleaf/logger'
+import settings from '@overleaf/settings'
+import { ObjectId } from 'mongodb'
 import ChatApiHandler from '../../../../app/src/Features/Chat/ChatApiHandler.mjs'
 import DocstoreManager from '../../../../app/src/Features/Docstore/DocstoreManager.mjs'
 import DocumentUpdaterHandler from '../../../../app/src/Features/DocumentUpdater/DocumentUpdaterHandler.mjs'
@@ -11,6 +14,7 @@ import UserInfoManager from '../../../../app/src/Features/User/UserInfoManager.m
 import { ID_REGEX, notFound } from './TokenApiAuthMiddleware.mjs'
 
 const MAX_MESSAGE_LENGTH = 10 * 1024 // chat's limit
+const MAX_QUOTE_LENGTH = 10 * 1024
 
 // A 404 (unknown thread, comment not in that doc) or 400 from chat or
 // document-updater becomes the API's fixed body; anything else is a 500.
@@ -38,6 +42,17 @@ function shortTime(isoString) {
 // op.p counts UTF-16 code units of lines.join('\n'), as does String.slice.
 function lineAt(text, offset) {
   return text.slice(0, offset).split('\n').length
+}
+
+// Offsets of all occurrences of quote in text (overlapping ones included).
+function findOffsets(text, quote) {
+  const offsets = []
+  let i = text.indexOf(quote)
+  while (i !== -1) {
+    offsets.push(i)
+    i = text.indexOf(quote, i + 1)
+  }
+  return offsets
 }
 
 function byFileLine(a, b) {
@@ -257,6 +272,135 @@ const TokenApiController = {
         id: message.id,
         time: iso(message.timestamp),
         content: message.content,
+      })
+    } catch (err) {
+      handleWriteError(err, res, next)
+    }
+  },
+
+  async createComment(req, res, next) {
+    const { project_id } = req.params
+    const { file, quote, content, offset } = req.body ?? {}
+    if (
+      typeof file !== 'string' ||
+      file === '' ||
+      typeof quote !== 'string' ||
+      quote === '' ||
+      quote.length > MAX_QUOTE_LENGTH ||
+      typeof content !== 'string' ||
+      content.trim() === '' ||
+      content.length > MAX_MESSAGE_LENGTH ||
+      (offset !== undefined && !(Number.isInteger(offset) && offset >= 0))
+    ) {
+      return res.status(400).json({ error: 'bad request' })
+    }
+    try {
+      const wanted = file.replace(/^\//, '')
+      const paths =
+        await ProjectEntityHandler.promises.getAllDocPathsFromProjectById(
+          project_id
+        )
+      const docId = Object.keys(paths).find(
+        id => paths[id].replace(/^\//, '') === wanted
+      )
+      if (!docId) return notFound(res)
+
+      const { lines } = await DocumentUpdaterHandler.promises.getDocument(
+        project_id,
+        docId,
+        -1
+      )
+      const text = lines.join('\n')
+      let at = offset
+      if (at !== undefined) {
+        if (text.slice(at, at + quote.length) !== quote) {
+          return res
+            .status(409)
+            .json({ error: 'conflict', reason: 'quote not at offset' })
+        }
+      } else {
+        const offsets = findOffsets(text, quote)
+        if (offsets.length === 0) {
+          return res
+            .status(409)
+            .json({ error: 'conflict', reason: 'quote not found' })
+        }
+        if (offsets.length > 1) {
+          return res.status(409).json({
+            error: 'conflict',
+            reason: 'quote ambiguous',
+            occurrences: offsets.length,
+          })
+        }
+        at = offsets[0]
+      }
+      const line = lineAt(text, at)
+
+      const threadId = new ObjectId().toString()
+      const userId = req.tokenUserId
+      const user = await UserInfoManager.promises.getPersonalInfo(userId)
+      // Creates the thread; the anchor below makes it visible in the doc.
+      const message = await ChatApiHandler.promises.sendComment(
+        project_id,
+        threadId,
+        userId,
+        content
+      )
+      try {
+        // All three IDs are 24-hex: project_id checked by the middleware,
+        // docId from the project, threadId generated above.
+        await fetchNothing(
+          `${settings.apis.documentupdater.url}/project/${project_id}/doc/${docId}/comment`,
+          {
+            method: 'POST',
+            json: {
+              thread_id: threadId,
+              user_id: userId,
+              text: quote,
+              offset: at,
+            },
+            signal: AbortSignal.timeout(30 * 1000),
+          }
+        )
+      } catch (err) {
+        // No orphan thread without an anchor.
+        try {
+          await ChatApiHandler.promises.deleteThread(project_id, threadId)
+        } catch (deleteErr) {
+          logger.warn(
+            { err: deleteErr, projectId: project_id, threadId },
+            'token-api: could not delete thread after failed anchor'
+          )
+        }
+        if (err instanceof RequestFailedError) {
+          if (err.response.status === 422) {
+            return res
+              .status(409)
+              .json({ error: 'conflict', reason: 'text changed' })
+          }
+          if (err.response.status === 404) return notFound(res)
+        }
+        return next(err)
+      }
+
+      message.user = UserInfoController.formatPersonalInfo(user)
+      EditorRealTimeController.emitToRoom(
+        project_id,
+        'new-comment',
+        threadId,
+        message
+      )
+      res.status(201).json({
+        thread_id: threadId,
+        doc_id: docId,
+        file: paths[docId].replace(/^\//, ''),
+        line,
+        quote,
+        message: {
+          id: message.id,
+          time: iso(message.timestamp),
+          content: message.content,
+        },
       })
     } catch (err) {
       handleWriteError(err, res, next)
