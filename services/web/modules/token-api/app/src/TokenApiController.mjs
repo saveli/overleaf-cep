@@ -15,6 +15,13 @@ const ID_REGEX = /^[0-9a-f]{24}$/
 const MAX_MESSAGE_LENGTH = 10 * 1024
 
 // Chat or document-updater answered 404 (unknown thread/doc) -> our 404 body.
+// Chat upserts threads on every lookup, so a mistyped thread ID would create an
+// orphan thread with no anchor. Only accept IDs chat already knows.
+async function threadExists(projectId, threadId) {
+  const threads = await ChatApiHandler.promises.getThreads(projectId)
+  return Object.hasOwn(threads, threadId)
+}
+
 function handleWriteError(err, res, next) {
   if (err instanceof RequestFailedError && err.response?.status === 404) {
     return notFound(res)
@@ -227,6 +234,7 @@ const TokenApiController = {
     }
     try {
       const { project_id, thread_id } = req.params
+      if (!(await threadExists(project_id, thread_id))) return notFound(res)
       const userId = req.tokenUserId
       const message = await ChatApiHandler.promises.sendComment(
         project_id,
@@ -255,6 +263,7 @@ const TokenApiController = {
   async resolveThread(req, res, next) {
     try {
       const { project_id, doc_id, thread_id } = req.params
+      if (!(await threadExists(project_id, thread_id))) return notFound(res)
       const userId = req.tokenUserId
       const user = await UserInfoManager.promises.getPersonalInfo(userId)
       await ChatApiHandler.promises.resolveThread(project_id, thread_id, userId)
@@ -279,6 +288,7 @@ const TokenApiController = {
   async reopenThread(req, res, next) {
     try {
       const { project_id, doc_id, thread_id } = req.params
+      if (!(await threadExists(project_id, thread_id))) return notFound(res)
       await ChatApiHandler.promises.reopenThread(project_id, thread_id)
       EditorRealTimeController.emitToRoom(project_id, 'reopen-thread', thread_id)
       await DocumentUpdaterHandler.promises.reopenThread(
