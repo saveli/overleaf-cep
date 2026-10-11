@@ -7,7 +7,8 @@ comments reviewers left in the editor, answer them, resolve them, or leave
 their own.
 
 Enabled together with the git bridge (`GIT_BRIDGE_ENABLED=true`); without it
-the module does nothing.
+the module does nothing. This file is served as `GET /api/v1` (Markdown, no
+token needed), so a client can be pointed at that URL.
 
 ## Authentication
 
@@ -42,6 +43,8 @@ Bodies are JSON.
 | POST | `/doc/:doc_id/thread/:thread_id/resolve` | Resolve a thread |
 | POST | `/doc/:doc_id/thread/:thread_id/reopen` | Reopen a thread |
 | GET | `/ranges` | Raw `ranges` object per doc (debugging) |
+
+`GET /api/v1` (without a project) returns this document.
 
 ### GET /threads
 

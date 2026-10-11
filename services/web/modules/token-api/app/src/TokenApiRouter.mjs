@@ -15,6 +15,12 @@ export default {
       tokenProjectAccess,
     ]
 
+    // API documentation (this module's README); no token needed.
+    publicApiRouter.get(
+      '/api/v1',
+      RateLimiterMiddleware.rateLimit(rateLimiter, { ipOnly: true }),
+      TokenApiController.docs
+    )
     publicApiRouter.get(
       '/api/v1/project/:project_id/ranges',
       ...guard,

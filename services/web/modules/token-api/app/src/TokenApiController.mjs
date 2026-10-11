@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { fetchNothing, RequestFailedError } from '@overleaf/fetch-utils'
 import logger from '@overleaf/logger'
 import settings from '@overleaf/settings'
@@ -17,6 +18,17 @@ import {
   z,
 } from '../../../../app/src/infrastructure/Validation.mjs'
 import { ID_REGEX, notFound, objectId } from './TokenApiAuthMiddleware.mjs'
+
+// The module README doubles as the API documentation, served at GET /api/v1.
+let README = null
+try {
+  README = readFileSync(new URL('../../README.md', import.meta.url), 'utf8')
+} catch (err) {
+  logger.warn(
+    { err },
+    'token-api: README.md not found, GET /api/v1 answers 404'
+  )
+}
 
 const MAX_MESSAGE_LENGTH = 10 * 1024 // chat's limit
 const MAX_QUOTE_LENGTH = 10 * 1024
@@ -177,6 +189,11 @@ const docThreadSchema = z.object({
 })
 
 const TokenApiController = {
+  docs(req, res) {
+    if (README == null) return notFound(res)
+    res.type('text/markdown; charset=utf-8').send(README)
+  },
+
   async getRanges(req, res, next) {
     try {
       const { project_id } = parseReq(req, projectSchema).params
