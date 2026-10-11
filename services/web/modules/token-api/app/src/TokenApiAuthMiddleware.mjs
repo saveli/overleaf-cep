@@ -2,10 +2,17 @@ import logger from '@overleaf/logger'
 import AuthorizationManager from '../../../../app/src/Features/Authorization/AuthorizationManager.mjs'
 import PrivilegeLevels from '../../../../app/src/Features/Authorization/PrivilegeLevels.mjs'
 import Errors from '../../../../app/src/Features/Errors/Errors.js'
+import {
+  InvalidParamsError,
+  parseReq,
+  z,
+} from '../../../../app/src/infrastructure/Validation.mjs'
 import GitBridgePATManager from '../../../git-bridge/app/src/GitBridgePATManager.mjs'
 
-const ID_PARAMS = ['project_id', 'doc_id', 'thread_id']
 export const ID_REGEX = /^[0-9a-f]{24}$/
+// Not zz.objectId(): ObjectId.isValid also accepts upper-case hex and any
+// 12-character string.
+export const objectId = z.string().regex(ID_REGEX)
 const BEARER = /^Bearer\s+(\S+)$/i
 
 // Members only: no site-admin shortcut, no legacy public access.
@@ -25,6 +32,15 @@ export function notFound(res) {
   res.status(404).json({ error: 'not found' })
 }
 
+// project_id on every route; doc_id and thread_id where the path has them.
+const idsSchema = z.object({
+  params: z.object({
+    project_id: objectId,
+    doc_id: objectId.optional(),
+    thread_id: objectId.optional(),
+  }),
+})
+
 export default async function tokenProjectAccess(req, res, next) {
   try {
     res.set('Cache-Control', 'no-store')
@@ -35,7 +51,7 @@ export default async function tokenProjectAccess(req, res, next) {
     const userId = await GitBridgePATManager.getUserId(match[1])
     if (!userId) return unauthorized(req, res, 'invalid token')
 
-    const projectId = req.params.project_id
+    let projectId
     // One audit line per authenticated request, including 404s and aborted
     // connections ('close' fires in both cases, 'finish' only on success).
     res.on('close', () => {
@@ -51,11 +67,13 @@ export default async function tokenProjectAccess(req, res, next) {
       )
     })
 
-    for (const name of ID_PARAMS) {
-      const value = req.params[name]
-      if (value !== undefined && !ID_REGEX.test(value)) return notFound(res)
+    // Malformed ids answer 404 before the membership check sees them.
+    try {
+      projectId = parseReq(req, idsSchema).params.project_id
+    } catch (err) {
+      if (err instanceof InvalidParamsError) return notFound(res)
+      throw err
     }
-    if (!projectId) return notFound(res)
 
     let level
     try {

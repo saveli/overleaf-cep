@@ -11,14 +11,23 @@ import ProjectGetter from '../../../../app/src/Features/Project/ProjectGetter.mj
 import UserGetter from '../../../../app/src/Features/User/UserGetter.mjs'
 import UserInfoController from '../../../../app/src/Features/User/UserInfoController.mjs'
 import UserInfoManager from '../../../../app/src/Features/User/UserInfoManager.mjs'
-import { ID_REGEX, notFound } from './TokenApiAuthMiddleware.mjs'
+import {
+  InvalidRequestError,
+  parseReq,
+  z,
+} from '../../../../app/src/infrastructure/Validation.mjs'
+import { ID_REGEX, notFound, objectId } from './TokenApiAuthMiddleware.mjs'
 
 const MAX_MESSAGE_LENGTH = 10 * 1024 // chat's limit
 const MAX_QUOTE_LENGTH = 10 * 1024
 
-// A 404 (unknown thread, comment not in that doc) or 400 from chat or
-// document-updater becomes the API's fixed body; anything else is a 500.
+// A bad request body, or a 404 (unknown thread, comment not in that doc) or
+// 400 from chat or document-updater, becomes the API's fixed body; anything
+// else is a 500.
 function handleWriteError(err, res, next) {
+  if (err instanceof InvalidRequestError) {
+    return res.status(400).json({ error: 'bad request' })
+  }
   if (err instanceof RequestFailedError) {
     if (err.response.status === 404) return notFound(res)
     if (err.response.status === 400) {
@@ -126,10 +135,51 @@ function toMarkdown(view) {
   return out.join('\n') + '\n'
 }
 
+// Ids are already checked by the middleware (malformed -> 404).
+const projectSchema = z.object({
+  params: z.object({ project_id: objectId }),
+})
+
+const getThreadsSchema = z.object({
+  params: z.object({ project_id: objectId }),
+  // Any other format (or a repeated one) falls back to JSON, never 400.
+  query: z.object({ format: z.literal('md').optional().catch(undefined) }),
+})
+
+// Content rules as in chat: not blank, at most chat's length limit.
+const contentSchema = z
+  .string()
+  .max(MAX_MESSAGE_LENGTH)
+  .refine(s => s.trim() !== '')
+
+const sendMessageSchema = z.object({
+  params: z.object({ project_id: objectId, thread_id: objectId }),
+  body: z.object({ content: contentSchema }),
+})
+
+const createCommentSchema = z.object({
+  params: z.object({ project_id: objectId }),
+  body: z.object({
+    file: z.string().min(1),
+    quote: z.string().min(1).max(MAX_QUOTE_LENGTH),
+    content: contentSchema,
+    // Number.isInteger, not .int(): .int() also caps at MAX_SAFE_INTEGER.
+    offset: z.number().min(0).refine(Number.isInteger).optional(),
+  }),
+})
+
+const docThreadSchema = z.object({
+  params: z.object({
+    project_id: objectId,
+    doc_id: objectId,
+    thread_id: objectId,
+  }),
+})
+
 const TokenApiController = {
   async getRanges(req, res, next) {
     try {
-      const { project_id } = req.params
+      const { project_id } = parseReq(req, projectSchema).params
       // Flush unflushed edits to docstore (docs stay loaded), then read all docs from there.
       await DocumentUpdaterHandler.promises.flushProjectToMongo(project_id)
       const docs = await DocstoreManager.promises.getAllRanges(project_id)
@@ -141,7 +191,8 @@ const TokenApiController = {
 
   async getThreads(req, res, next) {
     try {
-      const { project_id } = req.params
+      const { params, query } = parseReq(req, getThreadsSchema)
+      const { project_id } = params
       await DocumentUpdaterHandler.promises.flushProjectToMongo(project_id)
       // lines and ranges from one docstore read, so offsets match the text
       const [project, paths, docs, chatThreads] = await Promise.all([
@@ -176,12 +227,19 @@ const TokenApiController = {
       const userIds = []
       for (const thread of Object.values(chatThreads)) {
         userIds.push(thread.resolved_by_user_id)
-        for (const message of thread.messages ?? []) userIds.push(message.user_id)
+        for (const message of thread.messages ?? [])
+          userIds.push(message.user_id)
       }
-      for (const { change } of rawChanges) userIds.push(change.metadata?.user_id)
-      const author = await getAuthors(userIds.map(id => (id ? String(id) : null)))
+      for (const { change } of rawChanges)
+        userIds.push(change.metadata?.user_id)
+      const author = await getAuthors(
+        userIds.map(id => (id ? String(id) : null))
+      )
 
-      const threadIds = new Set([...Object.keys(chatThreads), ...anchors.keys()])
+      const threadIds = new Set([
+        ...Object.keys(chatThreads),
+        ...anchors.keys(),
+      ])
       const threads = [...threadIds].map(id => {
         const chat = chatThreads[id] ?? {}
         const anchor = anchors.get(id) ?? {
@@ -234,7 +292,7 @@ const TokenApiController = {
         threads,
         changes,
       }
-      if (req.query.format === 'md') {
+      if (query.format === 'md') {
         res.type('text/markdown; charset=utf-8').send(toMarkdown(view))
       } else {
         res.json(view)
@@ -246,15 +304,9 @@ const TokenApiController = {
 
   async sendMessage(req, res, next) {
     try {
-      const { project_id, thread_id } = req.params
-      const content = req.body?.content
-      if (
-        typeof content !== 'string' ||
-        content.trim() === '' ||
-        content.length > MAX_MESSAGE_LENGTH
-      ) {
-        return res.status(400).json({ error: 'bad request' })
-      }
+      const { params, body } = parseReq(req, sendMessageSchema)
+      const { project_id, thread_id } = params
+      const { content } = body
       // Reading a thread does not create it; sending to one does. Reject
       // unknown IDs instead of creating an orphan thread without an anchor.
       await ChatApiHandler.promises.getThread(project_id, thread_id)
@@ -284,22 +336,10 @@ const TokenApiController = {
   },
 
   async createComment(req, res, next) {
-    const { project_id } = req.params
-    const { file, quote, content, offset } = req.body ?? {}
-    if (
-      typeof file !== 'string' ||
-      file === '' ||
-      typeof quote !== 'string' ||
-      quote === '' ||
-      quote.length > MAX_QUOTE_LENGTH ||
-      typeof content !== 'string' ||
-      content.trim() === '' ||
-      content.length > MAX_MESSAGE_LENGTH ||
-      (offset !== undefined && !(Number.isInteger(offset) && offset >= 0))
-    ) {
-      return res.status(400).json({ error: 'bad request' })
-    }
     try {
+      const { params, body } = parseReq(req, createCommentSchema)
+      const { project_id } = params
+      const { file, quote, content, offset } = body
       const wanted = file.replace(/^\//, '')
       const paths =
         await ProjectEntityHandler.promises.getAllDocPathsFromProjectById(
@@ -310,11 +350,8 @@ const TokenApiController = {
       )
       if (!docId) return notFound(res)
 
-      const { lines, version } = await DocumentUpdaterHandler.promises.getDocument(
-        project_id,
-        docId,
-        -1
-      )
+      const { lines, version } =
+        await DocumentUpdaterHandler.promises.getDocument(project_id, docId, -1)
       const text = lines.join('\n')
       let at = offset
       if (at !== undefined) {
@@ -337,7 +374,10 @@ const TokenApiController = {
         }
         at = offsets[0]
       }
-      if (splitsSurrogatePair(text, at) || splitsSurrogatePair(text, at + quote.length)) {
+      if (
+        splitsSurrogatePair(text, at) ||
+        splitsSurrogatePair(text, at + quote.length)
+      ) {
         return res.status(400).json({ error: 'bad request' })
       }
       const line = lineAt(text, at)
@@ -391,7 +431,11 @@ const TokenApiController = {
         await ChatApiHandler.promises
           .deleteThread(project_id, threadId)
           .catch(e => warn(e, 'could not delete thread'))
-        EditorRealTimeController.emitToRoom(project_id, 'delete-thread', threadId)
+        EditorRealTimeController.emitToRoom(
+          project_id,
+          'delete-thread',
+          threadId
+        )
         if (err instanceof RequestFailedError) {
           // 422: text or version changed, too many comments, or not a ShareJS doc
           if (err.response.status === 422) {
@@ -423,10 +467,15 @@ const TokenApiController = {
 
   async resolveThread(req, res, next) {
     try {
-      const { project_id, doc_id, thread_id } = req.params
+      const { params } = parseReq(req, docThreadSchema)
+      const { project_id, doc_id, thread_id } = params
       // 404 unless the comment is anchored in this doc of this project; the
       // chat write below must not happen for a wrong doc_id.
-      await DocumentUpdaterHandler.promises.getComment(project_id, doc_id, thread_id)
+      await DocumentUpdaterHandler.promises.getComment(
+        project_id,
+        doc_id,
+        thread_id
+      )
       const userId = req.tokenUserId
       const user = await UserInfoManager.promises.getPersonalInfo(userId)
       await ChatApiHandler.promises.resolveThread(project_id, thread_id, userId)
@@ -450,10 +499,19 @@ const TokenApiController = {
 
   async reopenThread(req, res, next) {
     try {
-      const { project_id, doc_id, thread_id } = req.params
-      await DocumentUpdaterHandler.promises.getComment(project_id, doc_id, thread_id)
+      const { params } = parseReq(req, docThreadSchema)
+      const { project_id, doc_id, thread_id } = params
+      await DocumentUpdaterHandler.promises.getComment(
+        project_id,
+        doc_id,
+        thread_id
+      )
       await ChatApiHandler.promises.reopenThread(project_id, thread_id)
-      EditorRealTimeController.emitToRoom(project_id, 'reopen-thread', thread_id)
+      EditorRealTimeController.emitToRoom(
+        project_id,
+        'reopen-thread',
+        thread_id
+      )
       await DocumentUpdaterHandler.promises.reopenThread(
         project_id,
         doc_id,
